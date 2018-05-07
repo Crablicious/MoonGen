@@ -1,10 +1,12 @@
-package.path = package.path .. "rfc2544/?.lua;../rfc2544/?.lua;"
+--package.path = package.path .. "rfc2544/?.lua;../rfc2544/?.lua;"
+package.path = package.path .. ";rfc2544/?.lua;../rfc2544/?.lua;libmoon/lua/?.lua"
 
 if master == nil then
     master = "dummy"
 end
 
-local dpdk          = require "dpdk"
+-- local dpdk          = require "dpdk"
+local moongen       = require "moongen"
 local device        = require "device"
 local arp           = require "proto.arp"
 
@@ -22,21 +24,21 @@ local FRAME_SIZES   = {64, 128, 256, 512, 1024, 1280, 1518}
 
 local usageString = [[
 
-    --txport <txport> 
-    --rxport <rxport> 
-    
-    --rths <throughput rate threshold> 
+    --txport <txport>
+    --rxport <rxport>
+
+    --rths <throughput rate threshold>
     --mlr <max throuput loss rate>
-    
+
     --bths <back-to-back frame threshold>
-    
+
     --duration <single test duration>
-    --iterations <amount of test iterations>    
-    
+    --iterations <amount of test iterations>
+
     --din <DuT in interface name>
     --dout <DuT out iterface name>
     --dskip <skip DuT configuration>
-    
+
     --asksshpass <true|false> [ask at beginning for SSH password]
     --sshpass <SSH password>
     --sshuser <SSH user>
@@ -56,20 +58,21 @@ function log(file, msg, linebreak)
     end
 end
 
-function master()
+function master(...)
+    local arg = {...}
     local arguments = utils.parseArguments(arg)
     local txPort, rxPort = arguments.txport, arguments.rxport
     if not txPort or not rxPort then
         return print("usage: " .. usageString)
     end
-    
+
     local rateThreshold = arguments.rths or 100
     local btbThreshold = arguments.bths or 100
     local duration = arguments.duration or 10
     local maxLossRate = arguments.mlr or 0.001
     local dskip = arguments.dskip
     local numIterations = arguments.iterations
-    
+
     if type(arguments.sshpass) == "string" then
         conf.setSSHPass(arguments.sshpass)
     elseif arguments.asksshpass == "true" then
@@ -84,23 +87,23 @@ function master()
     elseif type(arguments.sshport) == "number" then
         conf.setSSHPort(arguments.sshport)
     end
-    
+
     if type(arguments.snmpcomm) == "string" then
         conf.setSNMPComm(arguments.snmpcomm)
     elseif arguments.asksnmpcomm == "true" then
         io.write("snmp community: ")
         conf.setSNMPComm(io.read())
     end
-    
+
     if type(arguments.host) == "string" then
         conf.setHost(arguments.host)
     end
-    
+
     local dut = {
         ifIn = arguments.din,
         ifOut = arguments.dout
     }
-    
+
     local rxDev, txDev
     if txPort == rxPort then
         -- sending and receiving from the same port
@@ -112,18 +115,18 @@ function master()
         rxDev = device.config({port = rxPort, rxQueues = 3, txQueues = 3})
     end
     device.waitForLinks()
-    
+
     -- launch background arp table task
-    if txPort == rxPort then 
-        dpdk.launchLua(arp.arpTask, {
-            { 
+    if txPort == rxPort then
+        moongen.startTask(arp.arpTask, {
+            {
                 txQueue = txDev:getTxQueue(0),
                 rxQueue = txDev:getRxQueue(1),
                 ips = {"198.18.1.2", "198.19.1.2"}
             }
         })
     else
-        dpdk.launchLua(arp.arpTask, {
+        moongen.startTask(arp.arpTask, {
             {
                 txQueue = txDev:getTxQueue(0),
                 rxQueue = txDev:getRxQueue(1),
@@ -136,20 +139,20 @@ function master()
             }
         })
     end
-    
+
     -- create testresult folder if not exist
     -- there is no clean lua way without using 3rd party libs
     local folderName = "testresults_" .. date
-    os.execute("mkdir -p " .. folderName)    
-    
+    os.execute("mkdir -p " .. folderName)
+
     local report = testreport.new(folderName .. "/rfc_2544_testreport.tex")
     local results = {}
-    
+
     local thBench = throughput.benchmark()
     thBench:init({
         txQueues = {txDev:getTxQueue(1), txDev:getTxQueue(2), txDev:getTxQueue(3)},
-        rxQueues = {rxDev:getRxQueue(0)}, 
-        duration = duration, 
+        rxQueues = {rxDev:getRxQueue(0)},
+        duration = duration,
         rateThreshold = rateThreshold,
         maxLossRate = maxLossRate,
         skipConf = dskip,
@@ -162,7 +165,7 @@ function master()
     for _, frameSize in ipairs(FRAME_SIZES) do
         local result, avgRate = thBench:bench(frameSize)
         rates[frameSize] = avgRate
-        
+
         -- save and report results
         table.insert(results, result)
         log(file, thBench:resultToCSV(result), true)
@@ -170,36 +173,36 @@ function master()
     end
     thBench:toTikz(folderName .. "/plot_throughput", unpack(results))
     file:close()
-    
+
     results = {}
     local latBench = latency.benchmark()
     latBench:init({
         txQueues = {txDev:getTxQueue(1), txDev:getTxQueue(2), txDev:getTxQueue(3), txDev:getTxQueue(4)},
         -- different receiving queue, for timestamping filter
-        rxQueues = {rxDev:getRxQueue(2)}, 
+        rxQueues = {rxDev:getRxQueue(2)},
         duration = duration,
         skipConf = dskip,
         dut = dut,
     })
-    
+
     file = io.open(folderName .. "/latency.csv", "w")
     log(file, latBench:getCSVHeader(), true)
     for _, frameSize in ipairs(FRAME_SIZES) do
         local result = latBench:bench(frameSize, math.ceil(rates[frameSize] * (frameSize + 20) * 8))
-        
-        -- save and report results        
+
+        -- save and report results
         table.insert(results, result)
         log(file, latBench:resultToCSV(result), true)
         report:addLatency(result, duration)
     end
     latBench:toTikz(folderName .. "/plot_latency", unpack(results))
     file:close()
-    
+
     results = {}
     local flBench = frameloss.benchmark()
     flBench:init({
         txQueues = {txDev:getTxQueue(1), txDev:getTxQueue(2), txDev:getTxQueue(3)},
-        rxQueues = {rxDev:getRxQueue(0)}, 
+        rxQueues = {rxDev:getRxQueue(0)},
         duration = duration,
         granularity = 0.05,
         skipConf = dskip,
@@ -209,7 +212,7 @@ function master()
     log(file, flBench:getCSVHeader(), true)
     for _, frameSize in ipairs(FRAME_SIZES) do
         local result = flBench:bench(frameSize)
-        
+
         -- save and report results
         table.insert(results, result)
         log(file, flBench:resultToCSV(result), true)
@@ -217,7 +220,7 @@ function master()
     end
     flBench:toTikz(folderName .. "/plot_frameloss", unpack(results))
     file:close()
-    
+
     results = {}
     local btbBench = backtoback.benchmark()
     btbBench:init({
@@ -232,7 +235,7 @@ function master()
     log(file, btbBench:getCSVHeader(), true)
     for _, frameSize in ipairs(FRAME_SIZES) do
         local result = btbBench:bench(frameSize)
-        
+
         -- save and report results
         table.insert(results, result)
         log(file, btbBench:resultToCSV(result), true)
@@ -242,5 +245,5 @@ function master()
     file:close()
 
     report:finalize()
-    
+
 end
