@@ -1,4 +1,4 @@
-package.path = package.path .. "rfc2544/?.lua;libmoon/lua/?.lua"
+package.path = package.path .. ";rfc2544/?.lua;libmoon/lua/?.lua"
 
 local standalone = false
 if master == nil then
@@ -44,6 +44,7 @@ function benchmark:init(arg)
 
     self.skipConf = arg.skipConf
     self.dut = arg.dut
+    self.memPools = arg.memPools
 
     self.initialized = true
 end
@@ -155,27 +156,13 @@ function benchmark:bench(frameSize)
         udpPayload[i] = bit.band(i, 0xf)
     end
 
-    local mem = memory.createMemPool(function(buf)
-        local pkt = buf:getUdpPacket()
-        pkt:fill{
-            pktLength = frameSize - 4, -- self sets all length headers fields in all used protocols, -4 for FCS
-            ethSrc = queue, -- get the src mac from the device
-            ethDst = ethDst,
-            -- does not affect performance, as self fill is done before any packet is sent
-            ip4Src = "198.18.1.2",
-            ip4Dst = "198.19.1.2",
-            udpSrc = UDP_PORT,
-            -- udpSrc will be set later as it varies
-        }
-        -- fill udp payload with prepared udp payload
-        ffi.copy(pkt.payload, udpPayload, udpPayloadLen)
-    end)
+    local mem = self.memPools[frameSize]
 
     for iteration=1, self.numIterations do
         printf("starting iteration %d for frame size %d", iteration, frameSize)
 
         local loadSlave = moongen.startTask("backtobackLoadSlave", self.txQueues[1], frameSize, nil, bar, self.granularity, self.duration, mem)
-        local counterSlave = moongen.startTask("backtobackCounterSlave", self.rxQueues[1], frameSize, bar, self.granularity, self.duration)
+        local counterSlave = moongen.startTask("backtobackCounterSlave", self.rxQueues[1], frameSize, bar, self.granularity, self.duration, mem)
 
         local longestS = loadSlave:wait()
         local longestR = counterSlave:wait()
@@ -192,7 +179,6 @@ function benchmark:bench(frameSize)
     if not self.skipConf then
         self:undoConfig()
     end
-    memory:freeMemPools()
     return results
 end
 
@@ -226,9 +212,6 @@ function sendBurst(numPkts, mem, queue, size, port, modFoo)
 end
 
 function backtobackLoadSlave(queue, frameSize, modifier, bar, granularity, duration, mem)
-    local ethDst = arp.blockingLookup("198.18.1.1", 10)
-    --TODO: error on timeout
-
     --wait for counter slave
     bar:wait()
     --TODO: dirty workaround for resetting a barrier
@@ -282,9 +265,9 @@ function backtobackLoadSlave(queue, frameSize, modifier, bar, granularity, durat
     return longest
 end
 
-function backtobackCounterSlave(queue, frameSize, bar, granularity, duration)
+function backtobackCounterSlave(queue, frameSize, bar, granularity, duration, mem)
 
-    local bufs = memory.bufArray()
+    local bufs = mem.bufArray()
 
     local maxPkts = math.ceil((queue.dev:getLinkStatus().speed * 10^6 / ((frameSize + 20) * 8)) * duration) -- theoretical max packets send in about `duration` seconds with linkspeed
     local count = maxPkts
@@ -389,6 +372,31 @@ if standalone then
             })
         end
 
+	local memPools = {}
+	local FRAME_SIZES   = {64, 128, 256, 512, 1024, 1280, 1518}
+	for _, frameSize in ipairs(FRAME_SIZES) do
+           -- gen payload template suggested by RFC2544
+	   local udpPayloadLen = frameSize - 46
+	   local udpPayload = ffi.new("uint8_t[?]", udpPayloadLen)
+	   for i = 0, udpPayloadLen - 1 do
+	      udpPayload[i] = bit.band(i, 0xf)
+	   end
+
+	   local mem = memory.createMemPool(function(buf)
+		 local pkt = buf:getUdpPacket()
+		 pkt:fill{
+		    pktLength = frameSize - 4, -- self sets all length headers fields in all used protocols, -4 for FCS
+		    ethSrc = queue, -- get the src mac from the device
+		    ethDst = ethDst,
+		    ip4Dst = "198.19.1.2",
+		    ip4Src = "198.18.1.2",
+		    udpSrc = SRC_PORT,
+		 }
+		 -- fill udp payload with prepared udp payload
+		 ffi.copy(pkt.payload, udpPayload, udpPayloadLen)
+	   end)
+	   memPools[frameSize] = mem
+	end
 
         local bench = benchmark()
         bench:init({
@@ -398,6 +406,7 @@ if standalone then
             duration = args.duration,
             numIterations = args.iterations,
             skipConf = true,
+	    memPools = memPools,
         })
 
         print(bench:getCSVHeader())

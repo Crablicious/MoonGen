@@ -41,6 +41,7 @@ function benchmark:init(arg)
 
     self.skipConf = arg.skipConf
     self.dut = arg.dut
+    self.memPools = arg.memPools
 
     self.initialized = true
 end
@@ -163,36 +164,7 @@ function benchmark:bench(frameSize)
     local rateSum = 0
     local finished = false
 
-    local ethDst = arp.blockingLookup("192.168.1.1", 10)
-    --TODO: error on timeout
-    -- gen payload template suggested by RFC2544
-    local udpPayloadLen = frameSize - 46
-    local udpPayload = ffi.new("uint8_t[?]", udpPayloadLen)
-    for i = 0, udpPayloadLen - 1 do
-        udpPayload[i] = bit.band(i, 0xf)
-    end
-
-    local mem = memory.createMemPool(function(buf)
-        local pkt = buf:getUdpPacket()
-        pkt:fill{
-            pktLength = frameSize - 4, -- self sets all length headers fields in all used protocols, -4 for FCS
-            ethSrc = queue, -- get the src mac from the device
-	    --ARGUMENTS: Alterar esse valor para endereço MAC da interface(DUT) que irá receber os pacotes
-            ethDst = ethDst,
-            -- TODO: too slow with conditional -- eventual launch a second slave for self
-            -- ethDst SHOULD be in 1% of the frames the hardware broadcast address
-            -- for switches ethDst also SHOULD be randomized
-
-            -- if ipDest is dynamical created it is overwritten
-            -- does not affect performance, as self fill is done before any packet is sent
-            ip4Src = "192.168.1.2",
-            ip4Dst = "192.168.1.2",
-            udpSrc = UDP_PORT,
-            -- udpSrc will be set later as it varies
-        }
-        -- fill udp payload with prepared udp payload
-        ffi.copy(pkt.payload, udpPayload, udpPayloadLen)
-    end)
+    local mem = self.memPools[frameSize]
 
     --repeat the test for statistical purpose
     for iteration=1,self.numIterations do
@@ -226,11 +198,11 @@ function benchmark:bench(frameSize)
             local loadTasks = {}
             -- traffic generator
             for i=1, numQueues do
-                table.insert(loadTasks, moongen.startTask("throughputLoadSlave", self.txQueues[i], port, frameSize, self.duration, mod, bar, mem))
+	       table.insert(loadTasks, moongen.startTask("throughputLoadSlave", self.txQueues[i], port, frameSize, self.duration, mod, bar, mem))
             end
 
             -- count the incoming packets
-            local ctrTask = moongen.startTask("throughputCounterSlave", self.rxQueues[1], port, frameSize, self.duration, bar)
+            local ctrTask = moongen.startTask("throughputCounterSlave", self.rxQueues[1], port, frameSize, self.duration, bar, mem)
 
             -- wait until all slaves are finished
             local spkts = 0
@@ -265,14 +237,14 @@ function benchmark:bench(frameSize)
             -- TODO: maybe wait for resettlement of DUT (RFC2544)
             port = port + 1
 	    moongen.sleepMillis(100)
-        --device.reclaimTxBuffers()
+	    -- device.reclaimTxBuffers()
         end
     end
 
     if not self.skipConf then
         self:undoConfig()
     end
-    memory:freeMemPools()
+
     return results, rateSum / self.numIterations
 end
 
@@ -305,20 +277,23 @@ function throughputLoadSlave(queue, port, frameSize, duration, modifier, bar, me
     -- warmup phase to wake up card
     local timer = timer:new(0.1)
     while timer:running() do
-        sendBufs(bufs, port - 1)
+       sendBufs(bufs, port - 1)
+       bufs:freeAll()
     end
 
     -- benchmark phase
     timer:reset(duration)
     local totalSent = 0
     while timer:running() do
-        totalSent = totalSent + sendBufs(bufs, port)
+       totalSent = totalSent + sendBufs(bufs, port)
+       bufs:freeAll()
     end
+
     return totalSent
 end
 
-function throughputCounterSlave(queue, port, frameSize, duration, bar)
-    local bufs = memory.bufArray()
+function throughputCounterSlave(queue, port, frameSize, duration, bar, mem)
+    local bufs = mem.bufArray()
     local stats = {}
     bar:wait()
 
@@ -380,6 +355,32 @@ if standalone then
             })
         end
 
+	local memPools = {}
+	local FRAME_SIZES   = {64, 128, 256, 512, 1024, 1280, 1518}
+	for _, frameSize in ipairs(FRAME_SIZES) do
+           -- gen payload template suggested by RFC2544
+	   local udpPayloadLen = frameSize - 46
+	   local udpPayload = ffi.new("uint8_t[?]", udpPayloadLen)
+	   for i = 0, udpPayloadLen - 1 do
+	      udpPayload[i] = bit.band(i, 0xf)
+	   end
+
+	   local mem = memory.createMemPool(function(buf)
+		 local pkt = buf:getUdpPacket()
+		 pkt:fill{
+		    pktLength = frameSize - 4, -- self sets all length headers fields in all used protocols, -4 for FCS
+		    ethSrc = queue, -- get the src mac from the device
+		    ethDst = ethDst,
+		    ip4Dst = "198.19.1.2",
+		    ip4Src = "198.18.1.2",
+		    udpSrc = SRC_PORT,
+		 }
+		 -- fill udp payload with prepared udp payload
+		 ffi.copy(pkt.payload, udpPayload, udpPayloadLen)
+	   end)
+	   memPools[frameSize] = mem
+	end
+
         local bench = benchmark()
         bench:init({
             txQueues = {txDev:getTxQueue(1), txDev:getTxQueue(2), txDev:getTxQueue(3)},
@@ -387,11 +388,11 @@ if standalone then
             duration = args.duration,
             numIterations = args.numiterations,
             skipConf = true,
+	    memPools = memPools,
         })
 
         print(bench:getCSVHeader())
         local results = {}
-        local FRAME_SIZES   = {64, 128, 256, 512, 1024, 1280, 1518}
         for _, frameSize in ipairs(FRAME_SIZES) do
             local result = bench:bench(frameSize)
             -- save and report results

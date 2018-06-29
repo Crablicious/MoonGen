@@ -5,6 +5,7 @@ local namespaces = require "namespaces"
 local ns = namespaces.get()
 
 function confirm()
+   os.execute("sleep 1");
    return 0;
    --[[
    local answer

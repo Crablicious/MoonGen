@@ -19,7 +19,8 @@ local timer         = require "timer"
 local utils         = require "utils.utils"
 local tikz          = require "utils.tikz"
 
-local UDP_PORT = 42
+-- local UDP_PORT = 42
+local UDP_PORT = 319
 
 local benchmark = {}
 benchmark.__index = benchmark
@@ -39,17 +40,19 @@ function benchmark:init(arg)
 
     self.skipConf = arg.skipConf
     self.dut = arg.dut
+    self.memPools = arg.memPools
 
     self.initialized = true
 end
 
 function benchmark:config()
-    self.undoStack = {}
-    utils.addInterfaceIP(self.dut.ifIn, "198.18.1.1", 24)
-    table.insert(self.undoStack, {foo = utils.delInterfaceIP, args = {self.dut.ifIn, "198.18.1.1", 24}})
+   self.undoStack = {}
+   -- TODO: Avoiding the config make latency measurements work, but is obviously not optimal.
+   --utils.addInterfaceIP(self.dut.ifIn, "198.18.1.1", 24)
+   --table.insert(self.undoStack, {foo = utils.delInterfaceIP, args = {self.dut.ifIn, "198.18.1.1", 24}})
 
-    utils.addInterfaceIP(self.dut.ifOut, "198.19.1.1", 24)
-    table.insert(self.undoStack, {foo = utils.delInterfaceIP, args = {self.dut.ifOut, "198.19.1.1", 24}})
+   --utils.addInterfaceIP(self.dut.ifOut, "198.19.1.1", 24)
+   --table.insert(self.undoStack, {foo = utils.delInterfaceIP, args = {self.dut.ifOut, "198.19.1.1", 24}})
 end
 
 function benchmark:undoConfig()
@@ -157,19 +160,8 @@ function benchmark:bench(frameSize, rate)
         udpPayload[i] = bit.band(i, 0xf)
     end
 
-    local mem = memory.createMemPool(function(buf)
-        local pkt = buf:getUdpPacket()
-        pkt:fill{
-            pktLength = frameSize - 4, -- self sets all length headers fields in all used protocols, -4 for FCS
-            ethSrc = queue, -- get the src mac from the device
-            ethDst = ethDst,
-            ip4Dst = "198.19.1.2",
-            ip4Src = "198.18.1.2",
-            udpSrc = SRC_PORT,
-        }
-        -- fill udp payload with prepared udp payload
-        ffi.copy(pkt.payload, udpPayload, udpPayloadLen)
-    end)
+    local mem = self.memPools[frameSize]
+    local ts_mem = self.memPools[-1]
 
     -- traffic generator
     local loadSlaves = {}
@@ -177,7 +169,7 @@ function benchmark:bench(frameSize, rate)
         table.insert(loadSlaves, moongen.startTask("latencyLoadSlave", self.txQueues[i], port, frameSize, self.duration, mod, bar, mem))
     end
 
-    local hist = latencyTimerSlave(self.txQueues[numQueues+1], self.rxQueues[1], port, frameSize, self.duration, bar)
+    local hist = latencyTimerSlave(self.txQueues[numQueues+1], self.rxQueues[1], port, frameSize, self.duration, bar, ts_mem)
     hist:print()
 
     local spkts = 0
@@ -191,14 +183,10 @@ function benchmark:bench(frameSize, rate)
     hist.frameSize = frameSize
     hist.rate = spkts / 10^6 / self.duration
 
-    memory:freeMemPools()
     return hist
 end
 
 function latencyLoadSlave(queue, port, frameSize, duration, modifier, bar, mem)
-    local ethDst = arp.blockingLookup("198.18.1.1", 10)
-    --TODO: error on timeout
-
     local bufs = mem:bufArray()
     --local modifierFoo = utils.getPktModifierFunction(modifier, baseIp, wrapIp, baseEth, wrapEth)
 
@@ -240,16 +228,16 @@ function latencyLoadSlave(queue, port, frameSize, duration, modifier, bar, mem)
     return totalSent
 end
 
-function latencyTimerSlave(txQueue, rxQueue, port, frameSize, duration, bar)
+function latencyTimerSlave(txQueue, rxQueue, port, frameSize, duration, bar, ts_mem)
     --Timestamped packets must be > 80 bytes (+4crc)
     frameSize = frameSize > 84 and frameSize or 84
 
-    local ethDst = arp.blockingLookup("198.18.1.1", 10)
+    --local ethDst = arp.blockingLookup("198.18.1.1", 10)
     --TODO: error on timeout
 
     --rxQueue.dev:filterTimestamps(rxQueue)
-    rxQueue:filterUdpTimestamps()
-    local timestamper = ts:newUdpTimestamper(txQueue, rxQueue)
+    --rxQueue:filterUdpTimestamps()
+    local timestamper = ts:newUdpTimestamper(txQueue, rxQueue, ts_mem)
     local hist = hist:new()
     local rateLimit = timer:new(0.001)
 
@@ -260,21 +248,9 @@ function latencyTimerSlave(txQueue, rxQueue, port, frameSize, duration, bar)
 
     local t = timer:new(duration)
     while t:running() do
-        hist:update(timestamper:measureLatency(frameSize - 4, function(buf)
-            local pkt = buf:getUdpPacket()
-            pkt:fill({
-                -- TODO: timestamp on different IPs
-                ethSrc = txQueue,
-                ethDst = ethDst,
-                ip4Src = "198.18.1.2",
-                ip4Dst = "198.19.1.2",
-                udpSrc = SRC_PORT,
-                udpDst = port,
-                pktLength = frameSize - 4
-            })
-        end))
-        rateLimit:wait()
-        rateLimit:reset()
+       hist:update(timestamper:measureLatency(frameSize - 4))
+       rateLimit:wait()
+       rateLimit:reset()
     end
     return hist
 end
@@ -323,19 +299,47 @@ if standalone then
             })
         end
 
-        local bench = benchmark()
-        bench:init({
+	local memPools = {}
+	local FRAME_SIZES   = {64, 128, 256, 512, 1024, 1280, 1518}
+	for _, frameSize in ipairs(FRAME_SIZES) do
+           -- gen payload template suggested by RFC2544
+	   local udpPayloadLen = frameSize - 46
+	   local udpPayload = ffi.new("uint8_t[?]", udpPayloadLen)
+	   for i = 0, udpPayloadLen - 1 do
+	      udpPayload[i] = bit.band(i, 0xf)
+	   end
+
+	   local mem = memory.createMemPool(function(buf)
+		 local pkt = buf:getUdpPacket()
+		 pkt:fill{
+		    pktLength = frameSize - 4, -- self sets all length headers fields in all used protocols, -4 for FCS
+		    ethSrc = queue, -- get the src mac from the device
+		    ethDst = ethDst,
+		    ip4Dst = "198.19.1.2",
+		    ip4Src = "198.18.1.2",
+		    udpSrc = SRC_PORT,
+		 }
+		 -- fill udp payload with prepared udp payload
+		 ffi.copy(pkt.payload, udpPayload, udpPayloadLen)
+	   end)
+	   memPools[frameSize] = mem
+	end
+
+
+       local bench = benchmark()
+       bench:init({
             txQueues = {txDev:getTxQueue(1), txDev:getTxQueue(2), txDev:getTxQueue(3), txDev:getTxQueue(4)},
             rxQueues = {rxDev:getRxQueue(2)},
             duration = args.duration,
             skipConf = true,
+	    memPools = memPools,
         })
 
         print(bench:getCSVHeader())
         local results = {}
-        local FRAME_SIZES   = {64, 128, 256, 512, 1024, 1280, 1518}
+
         for _, frameSize in ipairs(FRAME_SIZES) do
-            local result = bench:bench(frameSize, args.rate or 5000)
+	   local result = bench:bench(frameSize, args.rate or 5000)
             -- save and report results
             table.insert(results, result)
             print(bench:resultToCSV(result))

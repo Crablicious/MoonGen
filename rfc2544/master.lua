@@ -15,6 +15,8 @@ local latency       = require "benchmarks.latency"
 local frameloss     = require "benchmarks.frameloss"
 local backtoback    = require "benchmarks.backtoback"
 local utils         = require "utils.utils"
+local memory        = require "memory"
+local ffi           = require "ffi"
 
 local testreport    = require "utils.testreport"
 
@@ -66,8 +68,8 @@ function master(...)
         return print("usage: " .. usageString)
     end
 
-    local rateThreshold = arguments.rths or 100
-    local btbThreshold = arguments.bths or 100
+    local rateThreshold = arguments.rths or 10
+    local btbThreshold = arguments.bths or 10
     local duration = arguments.duration or 10
     local maxLossRate = arguments.mlr or 0.001
     local dskip = arguments.dskip
@@ -147,6 +149,39 @@ function master(...)
 
     local report = testreport.new(folderName .. "/rfc_2544_testreport.tex")
     local results = {}
+    local memPools = {}
+
+    local ethDst = arp.blockingLookup("198.18.1.1", 10)
+    --TODO: error on timeout
+
+    for _, frameSize in ipairs(FRAME_SIZES) do
+           -- gen payload template suggested by RFC2544
+       local udpPayloadLen = frameSize - 46
+       local udpPayload = ffi.new("uint8_t[?]", udpPayloadLen)
+       for i = 0, udpPayloadLen - 1 do
+	  udpPayload[i] = bit.band(i, 0xf)
+       end
+
+       local mem = memory.createMemPool(function(buf)
+	     local pkt = buf:getUdpPacket()
+	     pkt:fill{
+		pktLength = frameSize - 4, -- self sets all length headers fields in all used protocols, -4 for FCS
+		ethSrc = queue, -- get the src mac from the device
+		ethDst = ethDst,
+		ip4Dst = "198.19.1.2",
+		ip4Src = "198.18.1.2",
+		udpSrc = SRC_PORT,
+	     }
+	     -- fill udp payload with prepared udp payload
+	     ffi.copy(pkt.payload, udpPayload, udpPayloadLen)
+       end)
+       memPools[frameSize] = mem
+    end
+    -- Timestamper mempool in -1.
+    memPools[-1] = memory.createMemPool(function(buf)
+	  buf:getUdpPtpPacket():fill{ethSrc = txQueue,}
+    end)
+
 
     local thBench = throughput.benchmark()
     thBench:init({
@@ -158,6 +193,7 @@ function master(...)
         skipConf = dskip,
         dut = dut,
         numIterations = numIterations,
+	memPools = memPools,
     })
     local rates = {}
     local file = io.open(folderName .. "/throughput.csv", "w")
@@ -173,6 +209,8 @@ function master(...)
     end
     thBench:toTikz(folderName .. "/plot_throughput", unpack(results))
     file:close()
+    thBench = nil
+    throughput = nil
 
     results = {}
     local latBench = latency.benchmark()
@@ -183,6 +221,7 @@ function master(...)
         duration = duration,
         skipConf = dskip,
         dut = dut,
+	memPools = memPools,
     })
 
     file = io.open(folderName .. "/latency.csv", "w")
@@ -197,6 +236,7 @@ function master(...)
     end
     latBench:toTikz(folderName .. "/plot_latency", unpack(results))
     file:close()
+    latBench = nil
 
     results = {}
     local flBench = frameloss.benchmark()
@@ -207,6 +247,7 @@ function master(...)
         granularity = 0.05,
         skipConf = dskip,
         dut = dut,
+	memPools = memPools,
     })
     file = io.open(folderName .. "/frameloss.csv", "w")
     log(file, flBench:getCSVHeader(), true)
@@ -220,6 +261,7 @@ function master(...)
     end
     flBench:toTikz(folderName .. "/plot_frameloss", unpack(results))
     file:close()
+    flBench = nil
 
     results = {}
     local btbBench = backtoback.benchmark()
@@ -230,6 +272,7 @@ function master(...)
         skipConf = dskip,
         numIterations = numIterations,
         dut = dut,
+	memPools = memPools,
     })
     file = io.open(folderName .. "/backtoback.csv", "w")
     log(file, btbBench:getCSVHeader(), true)
@@ -243,7 +286,7 @@ function master(...)
     end
     btbBench:toTikz(folderName .. "/plot_backtoback", unpack(results))
     file:close()
+    btbBench = nil
 
     report:finalize()
-
 end

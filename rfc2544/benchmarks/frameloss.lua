@@ -41,6 +41,7 @@ function benchmark:init(arg)
 
     self.skipConf = arg.skipConf
     self.dut = arg.dut
+    self.memPools = arg.memPools
 
     self.initialized = true
 end
@@ -131,29 +132,7 @@ function benchmark:bench(frameSize, maxLossRate)
     local port = UDP_PORT
     local lastNoLostFrame = false
 
-    -- gen payload template suggested by RFC2544
-    local udpPayloadLen = frameSize - 46
-    local udpPayload = ffi.new("uint8_t[?]", udpPayloadLen)
-    for i = 0, udpPayloadLen - 1 do
-        udpPayload[i] = bit.band(i, 0xf)
-    end
-
-    local mem = memory.createMemPool(function(buf)
-        local pkt = buf:getUdpPacket()
-        pkt:fill{
-            pktLength = frameSize - 4, -- self sets all length headers fields in all used protocols, -4 for FCS
-            ethSrc = queue, -- get the src mac from the device
-            ethDst = ethDst,
-            -- if ipDest is dynamical created it is overwritten
-            -- does not affect performance, as self fill is done before any packet is sent
-            ip4Src = "198.18.1.2",
-            ip4Dst = "198.19.1.2",
-            udpSrc = UDP_PORT,
-            -- udpSrc will be set later as it varies
-        }
-        -- fill udp payload with prepared udp payload
-        ffi.copy(pkt.payload, udpPayload, udpPayloadLen)
-    end)
+    local mem = self.memPools[frameSize]
 
     -- loop until no packetloss
     while moongen.running() and rateMulti >= 0.05 do
@@ -183,7 +162,7 @@ function benchmark:bench(frameSize, maxLossRate)
         end
 
         -- count the incoming packets
-        local ctrTask = moongen.startTask("framelossCounterSlave", self.rxQueues[1], port, frameSize, self.duration, bar)
+        local ctrTask = moongen.startTask("framelossCounterSlave", self.rxQueues[1], port, frameSize, self.duration, bar, mem)
 
         -- wait until all slaves are finished
         local spkts = 0
@@ -216,14 +195,10 @@ function benchmark:bench(frameSize, maxLossRate)
     if not self.skipConf then
         self:undoConfig()
     end
-    memory:freeMemPools()
     return results
 end
 
 function framelossLoadSlave(queue, port, frameSize, duration, modifier, bar, mem)
-    local ethDst = arp.blockingLookup("198.18.1.1", 10)
-    --TODO: error on timeout
-
     --wait for counter slave
     bar:wait()
 
@@ -268,8 +243,8 @@ function framelossLoadSlave(queue, port, frameSize, duration, modifier, bar, mem
     return total
 end
 
-function framelossCounterSlave(queue, port, frameSize, duration, bar)
-    local bufs = memory.bufArray()
+function framelossCounterSlave(queue, port, frameSize, duration, bar, mem)
+    local bufs = mem.bufArray()
     local ctrs = {}
     bar:wait()
 
@@ -295,7 +270,7 @@ end
 --for standalone benchmark
 if standalone then
    function master(txPort, rxPort, duration, ...)
-        local arg = {...}
+        local arg = {txPort, rxPort, duration, ...}
         local args = utils.parseArguments(arg)
         local txPort, rxPort = args.txport, args.rxport
         if not txPort or not rxPort then
@@ -336,6 +311,32 @@ if standalone then
             })
         end
 
+	local memPools = {}
+	local FRAME_SIZES   = {64, 128, 256, 512, 1024, 1280, 1518}
+	for _, frameSize in ipairs(FRAME_SIZES) do
+           -- gen payload template suggested by RFC2544
+	   local udpPayloadLen = frameSize - 46
+	   local udpPayload = ffi.new("uint8_t[?]", udpPayloadLen)
+	   for i = 0, udpPayloadLen - 1 do
+	      udpPayload[i] = bit.band(i, 0xf)
+	   end
+
+	   local mem = memory.createMemPool(function(buf)
+		 local pkt = buf:getUdpPacket()
+		 pkt:fill{
+		    pktLength = frameSize - 4, -- self sets all length headers fields in all used protocols, -4 for FCS
+		    ethSrc = queue, -- get the src mac from the device
+		    ethDst = ethDst,
+		    ip4Dst = "198.19.1.2",
+		    ip4Src = "198.18.1.2",
+		    udpSrc = SRC_PORT,
+		 }
+		 -- fill udp payload with prepared udp payload
+		 ffi.copy(pkt.payload, udpPayload, udpPayloadLen)
+	   end)
+	   memPools[frameSize] = mem
+	end
+
         local bench = benchmark()
         bench:init({
             txQueues = {txDev:getTxQueue(1), txDev:getTxQueue(2), txDev:getTxQueue(3)},
@@ -343,11 +344,11 @@ if standalone then
             duration = args.duration,
             granularity = args.granularity,
             skipConf = true,
+	    memPools = memPools,
         })
 
         print(bench:getCSVHeader())
         local results = {}
-        local FRAME_SIZES   = {64, 128, 256, 512, 1024, 1280, 1518}
         for _, frameSize in ipairs(FRAME_SIZES) do
             local result = bench:bench(frameSize)
             -- save and report results
